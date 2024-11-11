@@ -1,108 +1,70 @@
-#include <iostream>
-#include <vector>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include <cub/device/device_radix_sort.cuh>
 #include <cuda_runtime.h>
+#include <thrust/copy.h>
+#include <thrust/device_vector.h>
 
-using namespace std;
-
-// Kernel CUDA para realizar o Counting Sort paralelamente
-__global__ void countingSortKernel(int* arr, int* count, int* output, int n, int exp)
-{
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-
-    if (idx < n)
-    {
-        int digit = (arr[idx] / exp) % 10;
-        atomicAdd(&count[digit], 1);
-    }
-
-    __syncthreads(); // Sincroniza os threads após o cálculo das contagens
-
-    if (idx < 10)
-    {
-        for (int i = 1; i < 10; i++)
-        {
-            count[i] += count[i - 1];
-        }
-    }
-
-    __syncthreads(); // Sincroniza antes de mover os elementos para a saída
-
-    if (idx < n)
-    {
-        int digit = (arr[idx] / exp) % 10;
-        int position = --count[digit];
-        output[position] = arr[idx];
+void conferirCuda(cudaError_t status) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(status));
     }
 }
 
-// Função de Radix Sort com CUDA
-void radixSortCuda(vector<int>& arr)
-{
-    int n = arr.size();
-    int *d_arr, *d_count, *d_output;
-
-    // Alocação de memória na GPU
-    cudaMalloc(&d_arr, n * sizeof(int));
-    cudaMalloc(&d_count, 10 * sizeof(int));
-    cudaMalloc(&d_output, n * sizeof(int));
-
-    // Copiar dados para a GPU
-    cudaMemcpy(d_arr, arr.data(), n * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemset(d_count, 0, 10 * sizeof(int)); // Limpar o contador de dígitos
-
-    int maxElem = *max_element(arr.begin(), arr.end());
-
-    // Realiza Counting Sort para cada dígito
-    for (int exp = 1; maxElem / exp > 0; exp *= 10)
-    {
-        // Lançamento de kernel para o Counting Sort
-        int blockSize = 256;
-        int numBlocks = (n + blockSize - 1) / blockSize;
-        countingSortKernel<<<numBlocks, blockSize>>>(d_arr, d_count, d_output, n, exp);
-
-        // Espera o kernel terminar
-        cudaDeviceSynchronize();
-
-        // Copiar os resultados de volta para a memória do host
-        cudaMemcpy(arr.data(), d_output, n * sizeof(int), cudaMemcpyDeviceToHost);
-
-        // Limpar o contador de dígitos para o próximo dígito
-        cudaMemset(d_count, 0, 10 * sizeof(int));
+void radixSortCuda(std::vector<int>& valores) {
+    if (valores.size() < 2) {
+        return;
+    }
+    if (valores.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::length_error("Vetor grande demais para esta configuração.");
     }
 
-    // Liberação de memória na GPU
-    cudaFree(d_arr);
-    cudaFree(d_count);
-    cudaFree(d_output);
+    const auto tamanho = static_cast<int>(valores.size());
+    thrust::device_vector<int> entrada(valores.begin(), valores.end());
+    thrust::device_vector<int> saida(tamanho);
+    auto* dadosEntrada = thrust::raw_pointer_cast(entrada.data());
+    auto* dadosSaida = thrust::raw_pointer_cast(saida.data());
+
+    // CUB informa primeiro o espaço temporário necessário à ordenação.
+    std::size_t bytesTemporarios = 0;
+    conferirCuda(cub::DeviceRadixSort::SortKeys(
+        nullptr, bytesTemporarios, dadosEntrada, dadosSaida, tamanho));
+    thrust::device_vector<unsigned char> temporario(bytesTemporarios);
+    conferirCuda(cub::DeviceRadixSort::SortKeys(
+        thrust::raw_pointer_cast(temporario.data()), bytesTemporarios,
+        dadosEntrada, dadosSaida, tamanho));
+    conferirCuda(cudaDeviceSynchronize());
+    thrust::copy(saida.begin(), saida.end(), valores.begin());
 }
 
-int main()
-{
-    vector<int> sizes = {100, 1000, 10000, 1000000, 10000000};
+int main() {
+    try {
+        const std::vector<int> tamanhos{100, 1000, 10000, 1000000, 10000000};
+        for (const int tamanho : tamanhos) {
+            std::vector<int> valores(tamanho);
+            std::generate(valores.begin(), valores.end(), [] { return std::rand() % 10000000; });
 
-    // Itera sobre os diferentes tamanhos de entrada
-    for (int n : sizes)
-    {
-        vector<int> arr(n);
-        // Gera números aleatórios para o array
-        for (int i = 0; i < n; i++)
-        {
-            arr[i] = rand() % 10000000;
+            const auto inicio = std::chrono::steady_clock::now();
+            radixSortCuda(valores);
+            const std::chrono::duration<double> duracao = std::chrono::steady_clock::now() - inicio;
+
+            if (!std::is_sorted(valores.begin(), valores.end())) {
+                throw std::runtime_error("O resultado da GPU está fora de ordem.");
+            }
+            std::cout << "Tempo de execução CUDA para " << tamanho << " elementos: "
+                      << std::fixed << std::setprecision(6) << duracao.count() << " segundos\n";
         }
-
-        // Inicia a medição de tempo
-        auto start = chrono::high_resolution_clock::now();
-        radixSortCuda(arr);
-        auto end = chrono::high_resolution_clock::now();
-
-        // Calcula a duração e imprime o tempo de execução
-        chrono::duration<double> duration = end - start;
-        cout << "Tempo de execucao Paralelo (CUDA) para " << n << " elementos: "
-            << fixed << setprecision(6) << duration.count() << " segundos" << endl;
+    } catch (const std::exception& erro) {
+        std::cerr << "Falha no Radix Sort CUDA: " << erro.what() << '\n';
+        return 1;
     }
-
     return 0;
 }
